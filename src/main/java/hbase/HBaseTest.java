@@ -22,17 +22,15 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeSet;
 
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.Cell;
-import org.apache.hadoop.hbase.CellScanner;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.Admin;
 import org.apache.hadoop.hbase.client.Connection;
 import org.apache.hadoop.hbase.client.ConnectionFactory;
-import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.ResultScanner;
@@ -51,7 +49,7 @@ public class HBaseTest {
     conf.addResource("/usr/local/lib/hadoop/etc/hadoop/hdfs-site.xml");
     conf.addResource("/usr/local/lib/hbase/conf/hbase-site.xml");
 
-    final boolean WRITE_DATA = true, READ_DATA = true;
+    final boolean NUKE_TABLE = true, WRITE_DATA = true, READ_DATA = true;
     final int NUM_ROWS = 1000 * 1000;
     final int NUM_COLS = 10;
     long entriesWritten = 0;
@@ -60,33 +58,37 @@ public class HBaseTest {
     Connection conn = ConnectionFactory.createConnection(conf);
     Admin admin = conn.getAdmin();
     Set<TableName> tables = new HashSet<>(Arrays.asList(admin.listTableNames()));
+    TreeSet<Integer> rowsWritten = new TreeSet<>();
     TableName tableName = TableName.valueOf("test");
 
-    // Disable+delete the table if it exists
-    if (tables.contains(tableName)) {
-      admin.disableTable(tableName);
-      admin.deleteTable(tableName);
+    if (NUKE_TABLE) {
+      // Disable+delete the table if it exists
+      if (tables.contains(tableName)) {
+        admin.disableTable(tableName);
+        admin.deleteTable(tableName);
+      }
+
+      // create the table
+      HTableDescriptor tableDesc = new HTableDescriptor(tableName);
+      tableDesc.addFamily(new HColumnDescriptor(cf));
+      byte[][] splits = new byte[9][2];
+      for (int i = 1; i < 10; i++) {
+        int split = 48 + i;
+        splits[i - 1][0] = (byte) (split >>> 8);
+        splits[i - 1][0] = (byte) (split);
+      }
+      admin.createTable(tableDesc, splits);
     }
 
-    // create the table
-    HTableDescriptor tableDesc = new HTableDescriptor(tableName);
-    tableDesc.addFamily(new HColumnDescriptor(cf));
-    byte[][] splits = new byte[9][2];
-    for (int i = 1; i < 10; i++) {
-      int split = 48 + i;
-      splits[i - 1][0] = (byte) (split >>> 8);
-      splits[i - 1][0] = (byte) (split);
-    }
-    admin.createTable(tableDesc, splits);
-
-    try (Table table = conn.getTable(tableName)) {
-      if (WRITE_DATA) {
+    if (WRITE_DATA) {
+      try (Table table = conn.getTable(tableName)) {
         table.setWriteBufferSize(1024 * 1024 * 50);
         System.out.println("Write buffer size: " + table.getWriteBufferSize());
 
         List<Put> puts = new ArrayList<>();
         // Write 1M rows * 10 columns = 10M k-v pairs
         for (int i = 0; i < NUM_ROWS; i++) {
+          rowsWritten.add(i);
           Put p = new Put(Integer.toString(i).getBytes());
           for (int j = 0; j < NUM_COLS; j++) {
             byte[] value = new byte[50];
@@ -95,7 +97,7 @@ public class HBaseTest {
           }
           puts.add(p);
 
-          // Flush the writes
+          // Flush the puts
           if (puts.size() == 1000) {
             Object[] results = new Object[1000];
             try {
@@ -104,6 +106,7 @@ public class HBaseTest {
               log.error("Failed to write data", e);
               log.info("Errors: {}", Arrays.toString(results));
             }
+
             entriesWritten += puts.size();
             puts.clear();
 
@@ -112,7 +115,6 @@ public class HBaseTest {
             }
           }
         }
-
         if (puts.size() > 0) {
           entriesWritten += puts.size();
           Object[] results = new Object[puts.size()];
@@ -127,27 +129,31 @@ public class HBaseTest {
         log.info("Wrote {} entries in total", entriesWritten);
       }
 
-      if (READ_DATA) {
+      log.info("Closing table used for writes");
+    }
+
+    if (READ_DATA) {
+      try (Table table = conn.getTable(tableName)) {
+        TreeSet<Integer> rows = new TreeSet<>();
         long rowsObserved = 0l;
         long entriesObserved = 0l;
-        ResultScanner scanner = table.getScanner(new Scan());
+        Scan s = new Scan();
+        s.addFamily(cf);
+        s.setMaxResultSize(-1);
+        s.setBatch(-1);
+        ResultScanner scanner = table.getScanner(s);
         String row = null;
         // Read all the records in the table
         for (Result result : scanner) {
           rowsObserved++;
           row = new String(result.getRow());
+          rows.add(Integer.parseInt(row));
           if (rowsObserved % 10000 == 0) {
             log.info("Saw row {}", row);
           }
-          CellScanner cells = result;
-          while (cells.advance()) {
+          while (result.advance()) {
             entriesObserved++;
-            if (entriesObserved % 100000 == 0) {
-              Cell cell = cells.current();
-              String family = new String(cell.getFamilyArray(), cell.getFamilyOffset(), cell.getFamilyLength());
-              String qualifier = new String(cell.getQualifierArray(), cell.getQualifierOffset(), cell.getQualifierLength());
-              log.info(row + " " + family + ":" + qualifier + " value[" + (cell.getValueLength() - cell.getValueOffset()) + "]");
-            }
+            // result.current();
           }
         }
         log.info("Last row in Result {}", row);
@@ -155,11 +161,12 @@ public class HBaseTest {
         // Verify that we see 1M rows and 10M cells
         log.info("Saw {} rows", rowsObserved);
         log.info("Saw {} cells", entriesObserved);
-      }
 
-      log.info(table.get(new Get("999997".getBytes())).toString());
-      log.info(table.get(new Get("999998".getBytes())).toString());
-      log.info(table.get(new Get("999999".getBytes())).toString());
+        rowsWritten.removeAll(rows);
+        String toString = rowsWritten.toString();
+        int len = Math.min(5000, toString.length());
+        log.info("Missing {} rows: {}{}", new Object[] {rowsWritten.size(), toString.substring(0, len), (len == toString.length() ? "" : "...")});
+      }
     }
   }
 }
