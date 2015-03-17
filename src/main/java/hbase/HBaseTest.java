@@ -61,24 +61,31 @@ public class HBaseTest {
     Admin admin = conn.getAdmin();
     Set<TableName> tables = new HashSet<>(Arrays.asList(admin.listTableNames()));
     TableName tableName = TableName.valueOf("test");
-    if (!tables.contains(tableName)) {
-      HTableDescriptor tableDesc = new HTableDescriptor(tableName);
-      tableDesc.addFamily(new HColumnDescriptor(cf));
-      byte[][] splits = new byte[9][2];
-      for (int i = 1; i < 10; i++) {
-        int split = 48 + i;
-        splits[i - 1][0] = (byte) (split >>> 8);
-        splits[i - 1][0] = (byte) (split);
-      }
-      admin.createTable(tableDesc, splits);
+
+    // Disable+delete the table if it exists
+    if (tables.contains(tableName)) {
+      admin.disableTable(tableName);
+      admin.deleteTable(tableName);
     }
 
-    try (Table table = conn.getTable(TableName.valueOf("test"))) {
+    // create the table
+    HTableDescriptor tableDesc = new HTableDescriptor(tableName);
+    tableDesc.addFamily(new HColumnDescriptor(cf));
+    byte[][] splits = new byte[9][2];
+    for (int i = 1; i < 10; i++) {
+      int split = 48 + i;
+      splits[i - 1][0] = (byte) (split >>> 8);
+      splits[i - 1][0] = (byte) (split);
+    }
+    admin.createTable(tableDesc, splits);
 
+    try (Table table = conn.getTable(tableName)) {
       if (WRITE_DATA) {
+        table.setWriteBufferSize(1024 * 1024 * 50);
         System.out.println("Write buffer size: " + table.getWriteBufferSize());
 
         List<Put> puts = new ArrayList<>();
+        // Write 1M rows * 10 columns = 10M k-v pairs
         for (int i = 0; i < NUM_ROWS; i++) {
           Put p = new Put(Integer.toString(i).getBytes());
           for (int j = 0; j < NUM_COLS; j++) {
@@ -124,14 +131,15 @@ public class HBaseTest {
         long rowsObserved = 0l;
         long entriesObserved = 0l;
         ResultScanner scanner = table.getScanner(new Scan());
-        String row;
+        String row = null;
+        // Read all the records in the table
         for (Result result : scanner) {
           rowsObserved++;
           row = new String(result.getRow());
-          if (rowsObserved % 1000 == 0) {
+          if (rowsObserved % 10000 == 0) {
             log.info("Saw row {}", row);
           }
-          CellScanner cells = result.cellScanner();
+          CellScanner cells = result;
           while (cells.advance()) {
             entriesObserved++;
             if (entriesObserved % 100000 == 0) {
@@ -141,9 +149,10 @@ public class HBaseTest {
               log.info(row + " " + family + ":" + qualifier + " value[" + (cell.getValueLength() - cell.getValueOffset()) + "]");
             }
           }
-          log.info("Last row {}", row);
         }
+        log.info("Last row in Result {}", row);
 
+        // Verify that we see 1M rows and 10M cells
         log.info("Saw {} rows", rowsObserved);
         log.info("Saw {} cells", entriesObserved);
       }
